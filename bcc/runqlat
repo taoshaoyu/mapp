@@ -98,55 +98,6 @@ static int trace_enqueue(u32 tgid, u32 pid)
 }
 """
 
-bpf_text_kprobe = """
-int trace_wake_up_new_task(struct pt_regs *ctx, struct task_struct *p)
-{
-    return trace_enqueue(p->tgid, p->pid);
-}
-
-int trace_ttwu_do_wakeup(struct pt_regs *ctx, struct rq *rq, struct task_struct *p,
-    int wake_flags)
-{
-    return trace_enqueue(p->tgid, p->pid);
-}
-
-// calculate latency
-int trace_run(struct pt_regs *ctx, struct task_struct *prev)
-{
-    u32 pid, tgid;
-
-    // ivcsw: treat like an enqueue event and store timestamp
-    if (prev->state == TASK_RUNNING) {
-        tgid = prev->tgid;
-        pid = prev->pid;
-        if (!(FILTER || pid == 0)) {
-            u64 ts = bpf_ktime_get_ns();
-            start.update(&pid, &ts);
-        }
-    }
-
-    tgid = bpf_get_current_pid_tgid() >> 32;
-    pid = bpf_get_current_pid_tgid();
-    if (FILTER || pid == 0)
-        return 0;
-    u64 *tsp, delta;
-
-    // fetch timestamp and calculate delta
-    tsp = start.lookup(&pid);
-    if (tsp == 0) {
-        return 0;   // missed enqueue
-    }
-    delta = bpf_ktime_get_ns() - *tsp;
-    FACTOR
-
-    // store as histogram
-    STORE
-
-    start.delete(&pid);
-    return 0;
-}
-"""
-
 bpf_text_raw_tp = """
 RAW_TRACEPOINT_PROBE(sched_wakeup)
 {
@@ -202,10 +153,9 @@ RAW_TRACEPOINT_PROBE(sched_switch)
 """
 
 is_support_raw_tp = BPF.support_raw_tracepoint()
+
 if is_support_raw_tp:
     bpf_text += bpf_text_raw_tp
-else:
-    bpf_text += bpf_text_kprobe
 
 # code substitutions
 if args.pid:

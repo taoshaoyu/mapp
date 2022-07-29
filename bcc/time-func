@@ -1,0 +1,100 @@
+#!/usr/libexec/platform-python
+
+from __future__ import print_function
+from bcc import BPF
+from time import sleep, strftime
+import argparse
+
+parser = argparse.ArgumentParser(
+    description="Time functions and print time spent in each function",
+    formatter_class=argparse.RawDescriptionHelpFormatter)
+parser.add_argument("-p", "--pid", type=int, help="trace this PID only")
+parser.add_argument("pattern", help="search expression for functions")
+args = parser.parse_args()
+
+# define BPF program
+bpf_text = """
+#include <uapi/linux/ptrace.h>
+
+struct stats_t {
+    u64 time;
+    u64 freq;
+};
+BPF_HASH(start, u32);
+BPF_HASH(ipaddr, u32);
+BPF_HASH(stats, u64, struct stats_t);
+
+int trace_func_entry(struct pt_regs *ctx)
+{
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    u32 pid = pid_tgid;
+    u64 ts = bpf_ktime_get_ns();
+
+    u64 ip = PT_REGS_IP(ctx);
+    ipaddr.update(&pid, &ip);
+    start.update(&pid, &ts);
+
+    return 0;
+}
+
+int trace_func_return(struct pt_regs *ctx)
+{
+    u64 *tsp, delta;
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    u32 pid = pid_tgid;
+
+    // calculate delta time
+    tsp = start.lookup(&pid);
+    if (tsp == 0) {
+        return 0;   // missed start
+    }
+    delta = bpf_ktime_get_ns() - *tsp;
+    start.delete(&pid);
+
+    // store as histogram
+    u64 ip, *ipp = ipaddr.lookup(&pid);
+    if (ipp) {
+        ip = *ipp;
+        struct stats_t *stat = stats.lookup(&ip);
+        if (stat) {
+            stat->time += delta;
+            stat->freq++;
+        } else {
+            struct stats_t s = {};
+            s.time = delta;
+            s.freq = 1;
+            stats.update(&ip, &s);
+        }
+        ipaddr.delete(&pid);
+    }
+
+    return 0;
+}
+"""
+
+# load BPF program
+b = BPF(text=bpf_text)
+pattern = args.pattern.replace('*', '.*')
+pattern = '^' + pattern + '$'
+b.attach_kprobe(event_re=pattern, fn_name="trace_func_entry")
+b.attach_kretprobe(event_re=pattern, fn_name="trace_func_return")
+matched = b.num_open_kprobes()
+
+if matched == 0:
+    print("0 functions matched by \"%s\". Exiting." % args.pattern)
+    exit()
+# header
+print("Tracing %d functions for \"%s\"... Hit Ctrl-C to end." %
+    (matched / 2, args.pattern))
+
+while (1):
+    try:
+        sleep(99999999)
+    except KeyboardInterrupt:
+        break
+
+print()
+print("%-36s %8s %16s" % ("FUNC", "COUNT", "TIME (nsecs)"))
+stats = b.get_table("stats")
+for k, v in stats.items():
+    print("%-36s %8s %16s" % (BPF.sym(k.value, -1), v.freq, v.time))
