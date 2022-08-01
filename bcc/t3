@@ -52,6 +52,9 @@ BPF_HASH(stats_k, u64, struct stats_t);
 BPF_HASH(start_k2, u32);
 BPF_HASH(ipaddr_k2, u32);
 BPF_HASH(stats_k2, u64, struct stats_t);
+BPF_HASH(start_k3, u32);
+BPF_HASH(ipaddr_k3, u32);
+BPF_HASH(stats_k3, u64, struct stats_t);
 
 int do_entry(struct pt_regs *ctx) {
     u64 pid_tgid = bpf_get_current_pid_tgid();
@@ -213,11 +216,72 @@ int trace_func2_return(struct pt_regs *ctx)
 
     return 0;
 }
+
+
+int trace_func3_entry(struct pt_regs *ctx)
+{
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    u32 pid = pid_tgid;
+    u64 ts = bpf_ktime_get_ns();
+    u64 *tsp;
+
+    tsp = start.lookup(&pid);
+    if (tsp == 0) {
+        return 0;   // missed start
+    }
+
+    u64 ip = PT_REGS_IP(ctx);
+    ipaddr_k3.update(&pid, &ip);
+    start_k3.update(&pid, &ts);
+
+    return 0;
+}
+
+int trace_func3_return(struct pt_regs *ctx)
+{
+    u64 *tsp, delta;
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    u32 pid = pid_tgid;
+
+    tsp = start.lookup(&pid);
+    if (tsp == 0) {
+        return 0;   // missed start
+    }
+
+    // calculate delta time
+    tsp = start_k3.lookup(&pid);
+    if (tsp == 0) {
+        return 0;   // missed start
+    }
+    delta = bpf_ktime_get_ns() - *tsp;
+    start_k3.delete(&pid);
+
+    // store as histogram
+    u64 ip, *ipp = ipaddr_k3.lookup(&pid);
+    if (ipp) {
+        ip = *ipp;
+        struct stats_t *stat = stats_k3.lookup(&ip);
+        if (stat) {
+            stat->time += delta;
+            stat->freq++;
+        } else {
+            struct stats_t s = {};
+            s.time = delta;
+            s.freq = 1;
+            stats_k3.update(&ip, &s);
+        }
+        ipaddr_k3.delete(&pid);
+    }
+
+    return 0;
+}
 """
 
 b = BPF(text=bpf_text)
 b.attach_kprobe(event_re="copy_process", fn_name="trace_func2_entry")
 b.attach_kretprobe(event_re="copy_process", fn_name="trace_func2_return")
+b.attach_kprobe(event_re="wake_up_new_task", fn_name="trace_func3_entry")
+b.attach_kretprobe(event_re="wake_up_new_task", fn_name="trace_func3_return")
 b.attach_kprobe(event_re="__x64_sys_clone", fn_name="trace_func_entry")
 b.attach_kretprobe(event_re="__x64_sys_clone", fn_name="trace_func_return")
 b.attach_uprobe(name=args.app_name, sym="xpthread_create", fn_name="do_entry")
@@ -251,5 +315,8 @@ for k, v in stats_k.items():
     print("%-36s %8s %16s" % (BPF.sym(k.value, -1), v.freq, v.time/v.freq))
 stats_k2 = b.get_table("stats_k2")
 for k, v in stats_k2.items():
+    print("%-36s %8s %16s" % (BPF.sym(k.value, -1), v.freq, v.time/v.freq))
+stats_k3 = b.get_table("stats_k3")
+for k, v in stats_k3.items():
     print("%-36s %8s %16s" % (BPF.sym(k.value, -1), v.freq, v.time/v.freq))
 
