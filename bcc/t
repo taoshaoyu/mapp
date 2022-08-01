@@ -1,100 +1,122 @@
 #!/usr/libexec/platform-python
+#
+# gethostlatency  Show latency for getaddrinfo/gethostbyname[2] calls.
+#                 For Linux, uses BCC, eBPF. Embedded C.
+#
+# This can be useful for identifying DNS latency, by identifying which
+# remote host name lookups were slow, and by how much.
+#
+# This uses dynamic tracing of user-level functions and registers, and may
+# need modifications to match your software and processor architecture.
+#
+# Copyright 2016 Netflix, Inc.
+# Licensed under the Apache License, Version 2.0 (the "License")
+#
+# 28-Jan-2016    Brendan Gregg   Created this.
+# 30-Mar-2016   Allan McAleavy updated for BPF_PERF_OUTPUT
 
 from __future__ import print_function
 from bcc import BPF
-from time import sleep, strftime
+from time import strftime
 import argparse
 
+examples = """examples:
+    ./gethostlatency           # time getaddrinfo/gethostbyname[2] calls
+    ./gethostlatency -p 181    # only trace PID 181
+"""
 parser = argparse.ArgumentParser(
-    description="Time functions and print time spent in each function",
-    formatter_class=argparse.RawDescriptionHelpFormatter)
-parser.add_argument("-p", "--pid", type=int, help="trace this PID only")
-parser.add_argument("pattern", help="search expression for functions")
+    description="Show latency for getaddrinfo/gethostbyname[2] calls",
+    formatter_class=argparse.RawDescriptionHelpFormatter,
+    epilog=examples)
+parser.add_argument("-p", "--pid", help="trace this PID only", type=int,
+    default=-1)
+parser.add_argument("--ebpf", action="store_true",
+    help=argparse.SUPPRESS)
 args = parser.parse_args()
 
-# define BPF program
+# load BPF program
 bpf_text = """
 #include <uapi/linux/ptrace.h>
+#include <linux/sched.h>
 
-struct stats_t {
-    u64 time;
-    u64 freq;
+struct val_t {
+    u32 pid;
+    char comm[TASK_COMM_LEN];
+    char host[80];
+    u64 ts;
 };
-BPF_HASH(start, u32);
-BPF_HASH(ipaddr, u32);
-BPF_HASH(stats, u64, struct stats_t);
 
-int trace_func_entry(struct pt_regs *ctx)
-{
-    u64 pid_tgid = bpf_get_current_pid_tgid();
-    u32 pid = pid_tgid;
-    u64 ts = bpf_ktime_get_ns();
+struct data_t {
+    u32 pid;
+    u64 delta;
+    char comm[TASK_COMM_LEN];
+    char host[80];
+};
 
-    u64 ip = PT_REGS_IP(ctx);
-    ipaddr.update(&pid, &ip);
-    start.update(&pid, &ts);
+BPF_HASH(start, u32, struct val_t);
+BPF_PERF_OUTPUT(events);
+
+int do_entry(struct pt_regs *ctx) {
+    if (!PT_REGS_PARM1(ctx))
+        return 0;
+
+    struct val_t val = {};
+    u32 pid = bpf_get_current_pid_tgid();
+
+    if (bpf_get_current_comm(&val.comm, sizeof(val.comm)) == 0) {
+        bpf_probe_read_user(&val.host, sizeof(val.host),
+                       (void *)PT_REGS_PARM1(ctx));
+        val.pid = bpf_get_current_pid_tgid();
+        val.ts = bpf_ktime_get_ns();
+        start.update(&pid, &val);
+    }
 
     return 0;
 }
 
-int trace_func_return(struct pt_regs *ctx)
-{
-    u64 *tsp, delta;
-    u64 pid_tgid = bpf_get_current_pid_tgid();
-    u32 pid = pid_tgid;
+int do_return(struct pt_regs *ctx) {
+    struct val_t *valp;
+    struct data_t data = {};
+    u64 delta;
+    u32 pid = bpf_get_current_pid_tgid();
 
-    // calculate delta time
-    tsp = start.lookup(&pid);
-    if (tsp == 0) {
-        return 0;   // missed start
-    }
-    delta = bpf_ktime_get_ns() - *tsp;
+    u64 tsp = bpf_ktime_get_ns();
+
+    valp = start.lookup(&pid);
+    if (valp == 0)
+        return 0;       // missed start
+
+    bpf_probe_read_kernel(&data.comm, sizeof(data.comm), valp->comm);
+    bpf_probe_read_kernel(&data.host, sizeof(data.host), (void *)valp->host);
+    data.pid = valp->pid;
+    data.delta = tsp - valp->ts;
+    events.perf_submit(ctx, &data, sizeof(data));
     start.delete(&pid);
-
-    // store as histogram
-    u64 ip, *ipp = ipaddr.lookup(&pid);
-    if (ipp) {
-        ip = *ipp;
-        struct stats_t *stat = stats.lookup(&ip);
-        if (stat) {
-            stat->time += delta;
-            stat->freq++;
-        } else {
-            struct stats_t s = {};
-            s.time = delta;
-            s.freq = 1;
-            stats.update(&ip, &s);
-        }
-        ipaddr.delete(&pid);
-    }
-
     return 0;
 }
 """
-
-# load BPF program
-b = BPF(text=bpf_text)
-pattern = args.pattern.replace('*', '.*')
-pattern = '^' + pattern + '$'
-b.attach_kprobe(event_re=pattern, fn_name="trace_func_entry")
-b.attach_kretprobe(event_re=pattern, fn_name="trace_func_return")
-matched = b.num_open_kprobes()
-
-if matched == 0:
-    print("0 functions matched by \"%s\". Exiting." % args.pattern)
+if args.ebpf:
+    print(bpf_text)
     exit()
+
+b = BPF(text=bpf_text)
+b.attach_uprobe(name="/home/sfdev/glibc/glibc-build/benchtests/bench-thread_create_m", sym="xpthread_create", fn_name="do_entry", pid=args.pid)
+b.attach_uretprobe(name="/home/sfdev/glibc/glibc-build/benchtests/bench-thread_create_m", sym="xpthread_create", fn_name="do_return",
+                   pid=args.pid)
+
 # header
-print("Tracing %d functions for \"%s\"... Hit Ctrl-C to end." %
-    (matched / 2, args.pattern))
+print("%-9s %-6s %-16s %10s %s" % ("TIME", "PID", "COMM", "LATms", "HOST"))
 
-while (1):
+def print_event(cpu, data, size):
+    event = b["events"].event(data)
+    print("%-9s %-6d %-16s %10.2f %s" % (strftime("%H:%M:%S"), event.pid,
+        event.comm.decode('utf-8', 'replace'), (float(event.delta) ),
+        event.host.decode('utf-8', 'replace')))
+
+# loop with callback to print_event
+b["events"].open_perf_buffer(print_event)
+while 1:
     try:
-        sleep(99999999)
+        b.perf_buffer_poll()
     except KeyboardInterrupt:
-        break
-
-print()
-print("%-36s %8s %16s" % ("FUNC", "COUNT", "TIME (nsecs)"))
-stats = b.get_table("stats")
-for k, v in stats.items():
-    print("%-36s %8s %16s" % (BPF.sym(k.value, -1), v.freq, v.time))
+        exit()
