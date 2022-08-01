@@ -16,8 +16,12 @@ void* DummyFunc(void* data)
     for( int i=0; i<100000; i++)
         for( int j=0; j<100000; j++)
             sum += i*j;
-  //  printf("2 sum=%d\n",sum);
+  //  printf("2 sum=%d\n",sum);a
+#if 0
     getcpu(&cpu, &node);
+#else
+    cpu=node=0;
+#endif
     printf("cpu = %d, node=%d\n",cpu, node);
     pthread_exit(NULL);			/* terminate the thread */
 }
