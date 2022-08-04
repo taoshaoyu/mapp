@@ -1,0 +1,461 @@
+#!/usr/libexec/platform-python
+#
+# gethostlatency  Show latency for getaddrinfo/gethostbyname[2] calls.
+#                 For Linux, uses BCC, eBPF. Embedded C.
+#
+# This can be useful for identifying DNS latency, by identifying which
+# remote host name lookups were slow, and by how much.
+#
+# This uses dynamic tracing of user-level functions and registers, and may
+# need modifications to match your software and processor architecture.
+#
+# Copyright 2016 Netflix, Inc.
+# Licensed under the Apache License, Version 2.0 (the "License")
+#
+# 28-Jan-2016    Brendan Gregg   Created this.
+# 30-Mar-2016   Allan McAleavy updated for BPF_PERF_OUTPUT
+
+from __future__ import print_function
+from bcc import BPF
+from time import strftime, sleep
+import argparse
+
+
+examples = """examples:
+    ./gethostlatency           # time getaddrinfo/gethostbyname[2] calls
+    ./gethostlatency -p 181    # only trace PID 181
+"""
+
+default_func1="wake_up_new_task"
+default_func2="copy_process"
+
+parser = argparse.ArgumentParser(
+    description="Show latency for getaddrinfo/gethostbyname[2] calls",
+    formatter_class=argparse.RawDescriptionHelpFormatter,
+    epilog=examples)
+
+parser.add_argument("-f1", "--func1", default=default_func1,    help="funcname 1")
+parser.add_argument("-f2", "--func2", default=default_func2,    help="funcname 2")
+
+parser.add_argument("app_name", help="asdf")
+
+args = parser.parse_args()
+
+# load BPF program
+bpf_text = """
+#include <uapi/linux/ptrace.h>
+#include <linux/sched.h>
+
+
+struct stats_t {
+    u64 time;
+    u64 freq;
+};
+
+struct data_t {
+    u32 pid;
+    char task[TASK_COMM_LEN];
+    u64 delta_us;
+};
+
+
+
+BPF_HASH(start_tp, u32);
+BPF_HASH(stats_tp, u32, struct stats_t);
+
+BPF_HASH(start, u32);
+BPF_HASH(ipaddr, u32);
+BPF_HASH(stats, u64, struct stats_t);
+BPF_HASH(start_k, u32);
+BPF_HASH(ipaddr_k, u32);
+BPF_HASH(stats_k, u64, struct stats_t);
+BPF_HASH(start_k2, u32);
+BPF_HASH(ipaddr_k2, u32);
+BPF_HASH(stats_k2, u64, struct stats_t);
+BPF_HASH(start_k3, u32);
+BPF_HASH(ipaddr_k3, u32);
+BPF_HASH(stats_k3, u64, struct stats_t);
+
+int do_entry(struct pt_regs *ctx) {
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    u32 pid = pid_tgid;
+    u64 ts = bpf_ktime_get_ns();
+
+    u64 ip = PT_REGS_IP(ctx);
+    ipaddr.update(&pid, &ip);
+    start.update(&pid, &ts);
+
+    return 0;
+}
+
+int do_return(struct pt_regs *ctx) {
+    u64 *tsp, delta;
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    u32 pid = pid_tgid;
+
+    // calculate delta time
+    tsp = start.lookup(&pid);
+    if (tsp == 0) {
+        return 0;   // missed start
+    }
+    delta = bpf_ktime_get_ns() - *tsp;
+    start.delete(&pid);
+
+    // store as histogram
+    u64 ip, *ipp = ipaddr.lookup(&pid);
+    if (ipp) {
+        ip = *ipp;
+        struct stats_t *stat = stats.lookup(&ip);
+        if (stat) {
+            stat->time += delta;
+            stat->freq++;
+        } else {
+            struct stats_t s = {};
+            s.time = delta;
+            s.freq = 1;
+            stats.update(&ip, &s);
+        }
+        ipaddr.delete(&pid);
+    }
+
+    return 0;
+}
+
+int trace_func_entry(struct pt_regs *ctx)
+{
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    u32 pid = pid_tgid;
+    u64 ts = bpf_ktime_get_ns();
+    u64 *tsp;
+
+    tsp = start.lookup(&pid);
+    if (tsp == 0) {
+        return 0;   // missed start
+    }
+
+    u64 ip = PT_REGS_IP(ctx);
+    ipaddr_k.update(&pid, &ip);
+    start_k.update(&pid, &ts);
+
+    return 0;
+}
+
+int trace_func_return(struct pt_regs *ctx)
+{
+    u64 *tsp, delta;
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    u32 pid = pid_tgid;
+
+    tsp = start.lookup(&pid);
+    if (tsp == 0) {
+        return 0;   // missed start
+    }
+
+    // calculate delta time
+    tsp = start_k.lookup(&pid);
+    if (tsp == 0) {
+        return 0;   // missed start
+    }
+    delta = bpf_ktime_get_ns() - *tsp;
+    start_k.delete(&pid);
+
+    // store as histogram
+    u64 ip, *ipp = ipaddr_k.lookup(&pid);
+    if (ipp) {
+        ip = *ipp;
+        struct stats_t *stat = stats_k.lookup(&ip);
+        if (stat) {
+            stat->time += delta;
+            stat->freq++;
+        } else {
+            struct stats_t s = {};
+            s.time = delta;
+            s.freq = 1;
+            stats_k.update(&ip, &s);
+        }
+        ipaddr_k.delete(&pid);
+    }
+
+    return 0;
+}
+
+int trace_func2_entry(struct pt_regs *ctx)
+{
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    u32 pid = pid_tgid;
+    u64 ts = bpf_ktime_get_ns();
+    u64 *tsp;
+
+    tsp = start.lookup(&pid);
+    if (tsp == 0) {
+        return 0;   // missed start
+    }
+
+    u64 ip = PT_REGS_IP(ctx);
+    ipaddr_k2.update(&pid, &ip);
+    start_k2.update(&pid, &ts);
+
+    return 0;
+}
+
+int trace_func2_return(struct pt_regs *ctx)
+{
+    u64 *tsp, delta;
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    u32 pid = pid_tgid;
+
+    tsp = start.lookup(&pid);
+    if (tsp == 0) {
+        return 0;   // missed start
+    }
+
+    // calculate delta time
+    tsp = start_k2.lookup(&pid);
+    if (tsp == 0) {
+        return 0;   // missed start
+    }
+    delta = bpf_ktime_get_ns() - *tsp;
+    start_k2.delete(&pid);
+
+    // store as histogram
+    u64 ip, *ipp = ipaddr_k2.lookup(&pid);
+    if (ipp) {
+        ip = *ipp;
+        struct stats_t *stat = stats_k2.lookup(&ip);
+        if (stat) {
+            stat->time += delta;
+            stat->freq++;
+        } else {
+            struct stats_t s = {};
+            s.time = delta;
+            s.freq = 1;
+            stats_k2.update(&ip, &s);
+        }
+        ipaddr_k2.delete(&pid);
+    }
+
+    return 0;
+}
+
+
+int trace_func3_entry(struct pt_regs *ctx)
+{
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    u32 pid = pid_tgid;
+    u64 ts = bpf_ktime_get_ns();
+    u64 *tsp;
+
+    tsp = start.lookup(&pid);
+    if (tsp == 0) {
+        return 0;   // missed start
+    }
+
+    u64 ip = PT_REGS_IP(ctx);
+    ipaddr_k3.update(&pid, &ip);
+    start_k3.update(&pid, &ts);
+
+    return 0;
+}
+
+int trace_func3_return(struct pt_regs *ctx)
+{
+    u64 *tsp, delta;
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    u32 pid = pid_tgid;
+
+    tsp = start.lookup(&pid);
+    if (tsp == 0) {
+        return 0;   // missed start
+    }
+
+    // calculate delta time
+    tsp = start_k3.lookup(&pid);
+    if (tsp == 0) {
+        return 0;   // missed start
+    }
+    delta = bpf_ktime_get_ns() - *tsp;
+    start_k3.delete(&pid);
+
+    // store as histogram
+    u64 ip, *ipp = ipaddr_k3.lookup(&pid);
+    if (ipp) {
+        ip = *ipp;
+        struct stats_t *stat = stats_k3.lookup(&ip);
+        if (stat) {
+            stat->time += delta;
+            stat->freq++;
+        } else {
+            struct stats_t s = {};
+            s.time = delta;
+            s.freq = 1;
+            stats_k3.update(&ip, &s);
+        }
+        ipaddr_k3.delete(&pid);
+    }
+
+    return 0;
+}
+
+
+static int trace_enqueue(u32 tgid, u32 pid)
+{
+    u64 *tsp;
+    if (pid == 0)
+        return 0;
+   
+    u64 ts = bpf_ktime_get_ns();
+    start_tp.update(&pid, &ts);
+    return 0;
+}
+
+
+#if 0
+RAW_TRACEPOINT_PROBE(sched_wakeup)
+{
+    // TP_PROTO(struct task_struct *p)
+    struct task_struct *p = (struct task_struct *)ctx->args[0];
+    return trace_enqueue(p->tgid, p->pid);
+}
+#endif
+
+RAW_TRACEPOINT_PROBE(sched_wakeup_new)
+{
+    // TP_PROTO(struct task_struct *p)
+    struct task_struct *p = (struct task_struct *)ctx->args[0];
+    u32 tgid, pid;
+    
+    #if 1
+        u64 * tsp;
+        u64 current_pid_tgid = bpf_get_current_pid_tgid();
+        u32 current_pid = current_pid_tgid;
+        tsp = start.lookup(&current_pid);
+        if (tsp == 0) {
+            return 0;   // missed start
+        }
+    #endif
+
+    bpf_probe_read_kernel(&tgid, sizeof(tgid), &p->tgid);
+    bpf_probe_read_kernel(&pid, sizeof(pid), &p->pid);
+    return trace_enqueue(tgid, pid);
+}
+
+RAW_TRACEPOINT_PROBE(sched_switch)
+{
+    // TP_PROTO(bool preempt, struct task_struct *prev, struct task_struct *next)
+    struct task_struct *prev = (struct task_struct *)ctx->args[1];
+    struct task_struct *next= (struct task_struct *)ctx->args[2];
+    u32 tgid, pid;
+    long state;
+
+#if 0    
+    // ivcsw: treat like an enqueue event and store timestamp
+    bpf_probe_read_kernel(&state, sizeof(long), (const void *)&prev->state);
+    if (state == TASK_RUNNING) {
+        bpf_probe_read_kernel(&tgid, sizeof(prev->tgid), &prev->tgid);
+        bpf_probe_read_kernel(&pid, sizeof(prev->pid), &prev->pid);
+        u64 ts = bpf_ktime_get_ns();
+        if (pid != 0) {
+            if (1) {
+                start_tp.update(&pid, &ts);
+            }
+        }
+    }
+#endif
+
+    bpf_probe_read_kernel(&pid, sizeof(next->pid), &next->pid);
+    bpf_probe_read_kernel(&tgid, sizeof(next->tgid), &next->tgid);
+
+    #if 0
+        u64 * next_tsp;
+        next_tsp = start.lookup(&tgid);
+        if (next_tsp == 0) {
+            return 0;   // missed start
+        }
+    #endif
+
+    u64 *tsp, delta_us;
+
+    // fetch timestamp and calculate delta
+    tsp = start_tp.lookup(&pid);
+    if (tsp == 0) {
+        return 0;   // missed enqueue
+    }
+    delta_us = (bpf_ktime_get_ns() - *tsp) / 1000;
+
+    struct data_t data = {};
+    data.pid = pid;
+    data.delta_us = delta_us;
+    bpf_probe_read_kernel_str(&data.task, sizeof(data.task), next->comm);
+
+    struct stats_t *stat = stats_tp.lookup(&tgid);
+        if (stat) {
+            stat->time += delta_us*1000;
+            stat->freq++;
+        } else {
+            struct stats_t s = {};
+            s.time = delta_us*1000;
+            s.freq = 1;
+            stats_tp.update(&tgid, &s);
+        }
+
+    start_tp.delete(&pid);
+    return 0;
+}
+"""
+
+b = BPF(text=bpf_text, debug=0x20)
+b.attach_kprobe(event_re=args.func1, fn_name="trace_func2_entry")
+b.attach_kretprobe(event_re=args.func1, fn_name="trace_func2_return")
+b.attach_kprobe(event_re=args.func2, fn_name="trace_func3_entry")
+b.attach_kretprobe(event_re=args.func2, fn_name="trace_func3_return")
+b.attach_kprobe(event_re="__x64_sys_clone", fn_name="trace_func_entry")
+b.attach_kretprobe(event_re="__x64_sys_clone", fn_name="trace_func_return")
+b.attach_uprobe(name=args.app_name, sym="xpthread_create", fn_name="do_entry")
+b.attach_uretprobe(name=args.app_name, sym="xpthread_create", fn_name="do_return")
+
+
+
+#b.attach_kprobe(event="ttwu_do_wakeup", fn_name="trace_ttwu_do_wakeup")
+#b.attach_kprobe(event="wake_up_new_task", fn_name="trace_wake_up_new_task")
+#b.attach_kprobe(event_re="^finish_task_switch$|^finish_task_switch\.isra\.\d$", fn_name="trace_run")
+
+
+is_support_raw_tp = BPF.support_raw_tracepoint()
+print("==is_support_raw_tp is %d"%(is_support_raw_tp))
+
+# header
+print("%-9s %-6s %-16s %10s %s" % ("TIME", "PID", "COMM", "LATms", "HOST"))
+
+def print_event(cpu, data, size):
+    event = b["events"].event(data)
+    print("%-9s %-6d %-16s %10.2f %s" % (strftime("%H:%M:%S"), event.pid,
+        event.comm.decode('utf-8', 'replace'), (float(event.delta) ),
+        event.host.decode('utf-8', 'replace')))
+
+# loop with callback to print_event
+
+while (1):
+    try:
+        sleep(99999999)
+    except KeyboardInterrupt:
+        break
+
+print()
+print("%-36s %8s %16s" % ("FUNC", "COUNT", "AVG TIME (nsecs)"))
+stats = b.get_table("stats")
+for k, v in stats.items():
+    print("%-36s %8s %16s" % (BPF.sym(k.value, -1), v.freq, v.time/v.freq))
+stats_k = b.get_table("stats_k")
+for k, v in stats_k.items():
+    print("%-36s %8s %16s" % (BPF.sym(k.value, -1), v.freq, v.time/v.freq))
+stats_k2 = b.get_table("stats_k2")
+for k, v in stats_k2.items():
+    print("%-36s %8s %16s" % (BPF.sym(k.value, -1), v.freq, v.time/v.freq))
+stats_k3 = b.get_table("stats_k3")
+for k, v in stats_k3.items():
+    print("%-36s %8s %16s" % (BPF.sym(k.value, -1), v.freq, v.time/v.freq))
+
+stats_tp = b.get_table("stats_tp")
+for k, v in stats_tp.items():
+    print("%-36s %8s %16s" % (k, v.freq, v.time/v.freq))
+
