@@ -37,6 +37,7 @@ parser = argparse.ArgumentParser(
 parser.add_argument("-f1", "--func1", default=default_func1,    help="funcname 1")
 parser.add_argument("-f2", "--func2", default=default_func2,    help="funcname 2")
 
+
 parser.add_argument("app_name", help="asdf")
 
 args = parser.parse_args()
@@ -404,10 +405,12 @@ RAW_TRACEPOINT_PROBE(sched_switch)
 """
 
 b = BPF(text=bpf_text, debug=0x20)
+
 b.attach_kprobe(event_re=args.func1, fn_name="trace_func2_entry")
 b.attach_kretprobe(event_re=args.func1, fn_name="trace_func2_return")
 b.attach_kprobe(event_re=args.func2, fn_name="trace_func3_entry")
 b.attach_kretprobe(event_re=args.func2, fn_name="trace_func3_return")
+
 b.attach_kprobe(event_re="__x64_sys_clone", fn_name="trace_func_entry")
 b.attach_kretprobe(event_re="__x64_sys_clone", fn_name="trace_func_return")
 b.attach_uprobe(name=args.app_name, sym="xpthread_create", fn_name="do_entry")
