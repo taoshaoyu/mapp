@@ -22,8 +22,7 @@ import argparse
 
 
 examples = """examples:
-    ./gethostlatency           # time getaddrinfo/gethostbyname[2] calls
-    ./gethostlatency -p 181    # only trace PID 181
+    ./t6 /home/taosy/glibc/glibc-build-gcc85/benchtests/bench-thread_create_m -f2 wake_up_new_task -f3 check_preempt_curr -f1 x2apic_send_IPI
 """
 
 default_func1="wake_up_new_task"
